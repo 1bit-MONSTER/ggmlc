@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import io
 import json
 import struct
@@ -129,14 +130,14 @@ def _serialize_attr_val(v: Any) -> Any:
     return str(v)
 
 
-def _graph_to_json_spec(graph: GGMLExecutionGraph) -> str:
+def _graph_to_json_spec(graph: GGMLExecutionGraph, name_map: dict[int, str] | None = None) -> str:
     """Serializes the execution graph DAG structure into a JSON specification string."""
     tensors_spec = {}
     for tid, t in graph.tensors.items():
         storage_int = STORAGE_TO_INT.get(t.storage, 0)
         tensors_spec[str(tid)] = {
             "id": t.id,
-            "name": t.name,
+            "name": name_map.get(tid, t.name) if name_map else t.name,
             "type": int(t.ggml_type),
             "ne": [_dim_to_dict(d) for d in t.ne],
             "storage": storage_int,
@@ -378,6 +379,31 @@ class GGUFWriter:
         return p
 
 
+def _shorten_tensor_names(graph: GGMLExecutionGraph) -> dict[int, str]:
+    """Map tensor ids to GGUF-safe names (< GGML_MAX_NAME chars, unique).
+
+    Short names pass through untouched (runner input names stay stable);
+    only overlong or colliding names are truncated with a hash suffix.
+    """
+    name_map: dict[int, str] = {}
+    seen: set[str] = set()
+    for tid in sorted(graph.tensors.keys()):
+        name = graph.tensors[tid].name or f"tensor_{tid}"
+        if len(name) < 64 and name not in seen:
+            name_map[tid] = name
+            seen.add(name)
+            continue
+        digest = hashlib.sha1(name.encode("utf-8")).hexdigest()[:8]
+        cand = f"{name[:54]}_{digest}"
+        n = 0
+        while cand in seen:
+            n += 1
+            cand = f"{name[:52]}_{digest}_{n}"[:63]
+        name_map[tid] = cand
+        seen.add(cand)
+    return name_map
+
+
 def _build_gguf_writer(
     graph: GGMLExecutionGraph,
     extra_metadata: dict[str, Any] | None = None,
@@ -413,17 +439,20 @@ def _build_gguf_writer(
 
     writer.add_string_array("ggmlc.symbol_table", graph.symbol_table)
 
-    # 2. Graph Spec JSON Metadata
-    spec_json = _graph_to_json_spec(graph)
+    # 2. Graph Spec JSON Metadata (tensor names shortened consistently with
+    # the tensor-info table: ggml rejects names >= GGML_MAX_NAME (64), and
+    # the native loader binds data by name, so both sides share the mapping)
+    name_map = _shorten_tensor_names(graph)
+    spec_json = _graph_to_json_spec(graph, name_map)
     writer.add_string("ggmlc.graph_spec", spec_json)
 
     # 4. Add Tensors with data (Parameters / Constants)
     used_names: set[str] = set()
     for _tid, t in sorted(graph.tensors.items()):
         if t.data is not None:
-            name = t.name
+            name = name_map.get(_tid, t.name)
             if name in used_names:
-                name = f"{name}_{_tid}"
+                name = f"{name[:56]}_{_tid}"[:63]
             used_names.add(name)
 
             # Prepare raw byte buffer and match GGUF shape to concrete data

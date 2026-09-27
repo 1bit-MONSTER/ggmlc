@@ -13,6 +13,7 @@
 #include <cstdlib>
 #include <vector>
 #include <climits>
+#include <cfloat>
 #include "ggml.h"
 #include "ggml-impl.h"
 #include "ggml-backend.h"
@@ -1891,12 +1892,19 @@ void ModelExecutor::prepare(const std::unordered_map<std::string, int64_t>& symb
                     t = ggml_mean(ctx_, t);
                     result = ggml_cont(ctx_, ggml_transpose(ctx_, t));
                 } else if (g_dim >= 2) {
-                    // Spatial reduction over dims 1 and 2 (e.g. NHWC global pool: [C, W, H, B] -> [C, 1, 1, B])
-                    struct ggml_tensor* flat_hw = reshape4d_contig(ctx_, in0, in0->ne[0], in0->ne[1] * in0->ne[2], 1, in0->ne[3]);
-                    flat_hw = ggml_cont(ctx_, flat_hw);
-                    struct ggml_tensor* t = ggml_cont(ctx_, ggml_transpose(ctx_, flat_hw));
-                    t = ggml_mean(ctx_, t);
-                    result = ggml_cont(ctx_, ggml_transpose(ctx_, t));
+                    // Single-axis reduction: swap axis g_dim to position 0,
+                    // reduce, swap back (ggml only reduces rows).
+                    struct ggml_tensor* t = in0;
+                    if (!ggml_is_contiguous(t)) t = ggml_cont(ctx_, t);
+                    if (g_dim == 2) {
+                        t = ggml_cont(ctx_, ggml_permute(ctx_, t, 2, 1, 0, 3));
+                        t = ggml_mean(ctx_, t);
+                        result = ggml_cont(ctx_, ggml_permute(ctx_, t, 2, 1, 0, 3));
+                    } else {
+                        t = ggml_cont(ctx_, ggml_permute(ctx_, t, 3, 1, 2, 0));
+                        t = ggml_mean(ctx_, t);
+                        result = ggml_cont(ctx_, ggml_permute(ctx_, t, 3, 1, 2, 0));
+                    }
                 } else {
                     result = ggml_mean(ctx_, in0);
                 }
@@ -1912,12 +1920,19 @@ void ModelExecutor::prepare(const std::unordered_map<std::string, int64_t>& symb
                     t = ggml_sum_rows(ctx_, t);
                     result = ggml_cont(ctx_, ggml_transpose(ctx_, t));
                 } else if (g_dim >= 2) {
-                    // Spatial reduction over dims 1 and 2 (e.g. NHWC global pool: [C, W, H, B] -> [C, 1, 1, B])
-                    struct ggml_tensor* flat_hw = reshape4d_contig(ctx_, in0, in0->ne[0], in0->ne[1] * in0->ne[2], 1, in0->ne[3]);
-                    flat_hw = ggml_cont(ctx_, flat_hw);
-                    struct ggml_tensor* t = ggml_cont(ctx_, ggml_transpose(ctx_, flat_hw));
-                    t = ggml_sum_rows(ctx_, t);
-                    result = ggml_cont(ctx_, ggml_transpose(ctx_, t));
+                    // Single-axis reduction: swap axis g_dim to position 0,
+                    // reduce, swap back (ggml only reduces rows).
+                    struct ggml_tensor* t = in0;
+                    if (!ggml_is_contiguous(t)) t = ggml_cont(ctx_, t);
+                    if (g_dim == 2) {
+                        t = ggml_cont(ctx_, ggml_permute(ctx_, t, 2, 1, 0, 3));
+                        t = ggml_sum_rows(ctx_, t);
+                        result = ggml_cont(ctx_, ggml_permute(ctx_, t, 2, 1, 0, 3));
+                    } else {
+                        t = ggml_cont(ctx_, ggml_permute(ctx_, t, 3, 1, 2, 0));
+                        t = ggml_sum_rows(ctx_, t);
+                        result = ggml_cont(ctx_, ggml_permute(ctx_, t, 3, 1, 2, 0));
+                    }
                 } else {
                     result = ggml_sum_rows(ctx_, in0);
                 }
@@ -1967,6 +1982,8 @@ void ModelExecutor::prepare(const std::unordered_map<std::string, int64_t>& symb
                     result = ggml_sigmoid(ctx_, act_in);
                 } else if (u == 8) { // GELU
                     result = ggml_gelu(ctx_, act_in);
+                } else if (u == 16) { // GELU_ERF
+                    result = ggml_unary(ctx_, act_in, GGML_UNARY_OP_GELU_ERF);
                 } else if (u == 10) { // SILU
                     result = ggml_silu(ctx_, act_in);
                 } else if (u == 11) { // HARDSWISH
@@ -2496,6 +2513,7 @@ void ModelExecutor::prepare(const std::unordered_map<std::string, int64_t>& symb
                 int g_dim = op.attributes.count("ggml_dim") ? static_cast<int>(op.attributes.at("ggml_dim")) : 0;
                 int64_t start = op.attributes.count("start") ? op.attributes.at("start") : 0;
                 int64_t step = op.attributes.count("step") ? op.attributes.at("step") : 1;
+                int64_t mult = op.attributes.count("offset_mult") ? op.attributes.at("offset_mult") : 1;
                 // Default: keep QKV fusion slices as non-contiguous views (zero copy).
                 // GGMLC_VIEW_FORCE_CONT=1 restores eager materialization for A/B.
                 if (env_flag_enabled("GGMLC_VIEW_FORCE_CONT")) {
@@ -2506,7 +2524,7 @@ void ModelExecutor::prepare(const std::unordered_map<std::string, int64_t>& symb
                     // Break pathological view-of-view chains that break offset math.
                     in0 = ggml_cont(ctx_, in0);
                 }
-                size_t offset = start * in0->nb[g_dim];
+                size_t offset = static_cast<size_t>(start * mult) * in0->nb[g_dim];
                 size_t nb1 = in0->nb[1] * (g_dim == 1 ? step : 1);
                 size_t nb2 = in0->nb[2] * (g_dim == 2 ? step : 1);
                 size_t nb3 = in0->nb[3] * (g_dim == 3 ? step : 1);
@@ -2621,8 +2639,7 @@ void ModelExecutor::prepare(const std::unordered_map<std::string, int64_t>& symb
                 // CUDA conv2d-dw is F32-only.
                 if (in0->type != GGML_TYPE_F32) in0 = ggml_cast(ctx_, in0, GGML_TYPE_F32);
                 if (in1->type != GGML_TYPE_F32) in1 = ggml_cast(ctx_, in1, GGML_TYPE_F32);
-                result = is_1d ? ggml_conv_2d_dw_direct(ctx_, in0, in1, s0, s1, p0, p1, d0, d1)
-                               : ggml_conv_2d_dw(ctx_, in0, in1, s0, s1, p0, p1, d0, d1);
+                result = ggml_conv_2d_dw_direct(ctx_, in0, in1, s0, s1, p0, p1, d0, d1);
                 if (op.inputs.size() > 2) {
                     struct ggml_tensor* bias = ggml_tensors_[op.inputs[2]];
                     if (bias) {
@@ -2646,9 +2663,9 @@ void ModelExecutor::prepare(const std::unordered_map<std::string, int64_t>& symb
             }
             case GGML_OP_CLAMP: {
                 float min_val = op.float_attributes.count("min") ? static_cast<float>(op.float_attributes.at("min"))
-                              : op.attributes.count("min") ? static_cast<float>(op.attributes.at("min")) : 0.0f;
+                              : op.attributes.count("min") ? static_cast<float>(op.attributes.at("min")) : -FLT_MAX;
                 float max_val = op.float_attributes.count("max") ? static_cast<float>(op.float_attributes.at("max"))
-                              : op.attributes.count("max") ? static_cast<float>(op.attributes.at("max")) : 6.0f;
+                              : op.attributes.count("max") ? static_cast<float>(op.attributes.at("max")) : FLT_MAX;
                 result = ggml_clamp(ctx_, in0, min_val, max_val);
                 break;
             }

@@ -10,7 +10,7 @@ from torch.fx import Node
 
 from ggmlc.frontend.pytorch.operators import get_opcode_for_aten
 from ggmlc.ir.dtype import DType
-from ggmlc.ir.graph import Graph
+from ggmlc.ir.graph import Graph, chain_single_axis_reduction
 from ggmlc.ir.op import OpCode
 from ggmlc.ir.shape import (
     AddDim,
@@ -79,6 +79,17 @@ def _symint_to_dim(sym: Any) -> Dim:
 def _torch_shape_to_shape(shape: Any) -> Shape:
     dims = [_symint_to_dim(d) for d in shape]
     return Shape(dims)
+
+
+def _norm_axes(dim: Any, rank: int) -> list[int]:
+    """Normalize a dim spec (int, list, tuple, or None) to non-negative axes."""
+    if dim is None:
+        return []
+    if isinstance(dim, (list, tuple)):
+        dims = [int(d) for d in dim]
+    else:
+        dims = [int(dim)]
+    return [d + rank if d < 0 else d for d in dims]
 
 
 def _restore_symbolic_batch_dim(g: Graph) -> None:
@@ -253,6 +264,7 @@ def import_exported_program(ep: ExportedProgram, graph_name: str = "main") -> Gr
             or "sym_numel" in target_str
             or "chunk" in target_str
             or "split" in target_str
+            or "unbind" in target_str
         ):
             # Symbolic scalar query node or multi-output container (handled via getitem)
             continue
@@ -261,16 +273,13 @@ def import_exported_program(ep: ExportedProgram, graph_name: str = "main") -> Gr
             parent = node.args[0]
             if isinstance(parent, Node):
                 parent_target_str = str(parent.target)
-                if ("split" in parent_target_str or "chunk" in parent_target_str) and isinstance(
-                    node.args[1], int
-                ):
+                if (
+                    "split" in parent_target_str
+                    or "chunk" in parent_target_str
+                    or "unbind" in parent_target_str
+                ) and isinstance(node.args[1], int):
                     idx = int(node.args[1])
                     split_input = parent.args[0]
-                    dim = (
-                        int(parent.args[2])
-                        if len(parent.args) > 2 and parent.args[2] is not None
-                        else 0
-                    )
                     val = node.meta.get("val")
                     shape = (
                         _torch_shape_to_shape(val.shape)
@@ -280,28 +289,39 @@ def import_exported_program(ep: ExportedProgram, graph_name: str = "main") -> Gr
                     dtype = (
                         DType.from_torch(val.dtype) if isinstance(val, torch.Tensor) else DType.F32
                     )
-                    if isinstance(val, torch.Tensor) and dim < 0:
-                        dim = len(val.shape) + dim
-                    if "chunk" in parent_target_str:
-                        sz = val.shape[dim] if isinstance(val, torch.Tensor) else 1
-                        start = idx * sz
-                        end = start + sz
-                    elif isinstance(parent.args[1], (list, tuple)):
-                        start = sum(parent.args[1][:idx])
-                        end = start + parent.args[1][idx]
+
+                    if "unbind" in parent_target_str:
+                        dim = (
+                            int(parent.args[1])
+                            if len(parent.args) > 1 and parent.args[1] is not None
+                            else 0
+                        )
+                        if isinstance(val, torch.Tensor) and dim < 0:
+                            dim = len(val.shape) + dim
+                        start = idx
+                        end = idx + 1
+
                     else:
-                        sz = int(parent.args[1])
-                        start = idx * sz
-                        end = (idx + 1) * sz
-                    val = node.meta.get("val")
-                    shape = (
-                        _torch_shape_to_shape(val.shape)
-                        if isinstance(val, torch.Tensor)
-                        else Shape([])
-                    )
-                    dtype = (
-                        DType.from_torch(val.dtype) if isinstance(val, torch.Tensor) else DType.F32
-                    )
+                        dim = (
+                            int(parent.args[2])
+                            if len(parent.args) > 2 and parent.args[2] is not None
+                            else 0
+                        )
+                        if isinstance(val, torch.Tensor) and dim < 0:
+                            dim = len(val.shape) + dim
+
+                        if "chunk" in parent_target_str:
+                            sz = val.shape[dim] if isinstance(val, torch.Tensor) else 1
+                            start = idx * sz
+                            end = start + sz
+                        elif isinstance(parent.args[1], (list, tuple)):
+                            start = sum(parent.args[1][:idx])
+                            end = start + parent.args[1][idx]
+                        else:
+                            sz = int(parent.args[1])
+                            start = idx * sz
+                            end = (idx + 1) * sz
+
                     out_t = g.add_tensor(
                         name=node.name,
                         shape=shape,
@@ -354,6 +374,7 @@ def import_exported_program(ep: ExportedProgram, graph_name: str = "main") -> Gr
 
         if (
             "split" in target_str
+            or "unbind" in target_str
             or "assert" in target_str
             or "check" in target_str
             or "to.dtype" in target_str
@@ -754,8 +775,70 @@ def import_exported_program(ep: ExportedProgram, graph_name: str = "main") -> Gr
                 attributes["dim1"] = 1
         elif opcode == OpCode.PERMUTE:
             # aten.permute.default(self, dims)
-            input_tensor_ids.append(node_to_tensor[node.args[0]].id)
-            attributes["dims"] = [int(d) for d in node.args[1]]
+            in_t = node_to_tensor[node.args[0]]
+            p = [int(d) % len(in_t.shape.dims) for d in node.args[1]]
+            if len(in_t.shape.dims) == 5 and (len(p) == 0 or p[0] != 0):
+                # ggml only permutes 4D: squeeze static unit dims so the
+                # transpose becomes a plain 4D permute. The output stays
+                # squeezed (unit dims move no data); downstream selects
+                # index it via FX meta shapes, unaffected by the squeeze.
+                kept = [
+                    i
+                    for i, d in enumerate(in_t.shape.dims)
+                    if not (d.is_static() and d.evaluate({}) == 1)
+                ]
+                if len(kept) > 4:
+                    raise NotImplementedError(
+                        f"5D permute '{node.name}' with dims {p} is not "
+                        f"expressible as a 4D ggml permute"
+                    )
+                sq_t = g.add_tensor(
+                    name=f"{node.name}_sq5",
+                    shape=Shape([in_t.shape.dims[i] for i in kept]),
+                    dtype=in_t.dtype,
+                    storage=StorageClass.ACTIVATION,
+                )
+                g.add_op(
+                    opcode=OpCode.RESHAPE,
+                    inputs=[in_t.id],
+                    outputs=[sq_t.id],
+                    name=f"{node.name}_sq5",
+                )
+                kept_out = [k for k in range(len(p)) if p[k] in kept]
+                p_reduced = [kept.index(p[k]) for k in kept_out]
+                val = node.meta.get("val")
+                out_shape = (
+                    _torch_shape_to_shape(val.shape)
+                    if val is not None and isinstance(val, torch.Tensor)
+                    else Shape([in_t.shape.dims[p[k]] for k in range(len(p))])
+                )
+                # Squeeze out unit dims so lowering sees a consistent 4D permute
+                if (
+                    len(in_t.shape.dims) == 5
+                    and out_shape.dims
+                    and out_shape.dims.count(StaticDim(1)) > 0
+                ):
+                    out_shape = Shape(
+                        d for d in out_shape.dims if not (d.is_static() and d.evaluate({}) == 1)
+                    )
+                out_t = g.add_tensor(
+                    name=node.name,
+                    shape=out_shape,
+                    dtype=in_t.dtype,
+                    storage=StorageClass.ACTIVATION,
+                )
+                g.add_op(
+                    opcode=OpCode.PERMUTE,
+                    inputs=[sq_t.id],
+                    outputs=[out_t.id],
+                    attributes={"dims": p_reduced},
+                    name=node.name,
+                )
+                node_to_tensor[node] = out_t
+                name_to_tensor[node.name] = out_t
+                continue
+            input_tensor_ids.append(in_t.id)
+            attributes["dims"] = p
         elif opcode == OpCode.SLICE:
             input_tensor_ids.append(node_to_tensor[node.args[0]].id)
             if "select" in str(node.target):
@@ -777,18 +860,41 @@ def import_exported_program(ep: ExportedProgram, graph_name: str = "main") -> Gr
                 attributes["start"] = start
                 attributes["end"] = end
                 attributes["step"] = step
+        elif opcode == OpCode.GELU:
+            input_tensor_ids.append(node_to_tensor[node.args[0]].id)
+            approx = node.kwargs.get("approximate", node.args[1] if len(node.args) > 1 else "none")
+            attributes["approximate"] = str(approx).lower()
         elif opcode == OpCode.MEAN:
-            input_tensor_ids.append(node_to_tensor[node.args[0]].id)
+            in_t = node_to_tensor[node.args[0]]
             dim = node.args[1] if len(node.args) > 1 else -1
-            attributes["dim"] = int(dim[0]) if isinstance(dim, (list, tuple)) else int(dim)
-            attributes["keepdim"] = 1 if len(node.args) > 2 and node.args[2] else 0
+            keepdim = bool(len(node.args) > 2 and node.args[2])
+            normed = _norm_axes(dim, len(in_t.shape.dims))
+            if len(normed) > 1:
+                # Multi-dim reduction: chain single-dim means (ggml reduces
+                # one axis); keepdim intermediates keep ranks aligned.
+                cur_t = chain_single_axis_reduction(
+                    g, in_t, OpCode.MEAN, normed, keepdim, node.name
+                )
+                node_to_tensor[node] = cur_t
+                name_to_tensor[node.name] = cur_t
+                continue
+            input_tensor_ids.append(in_t.id)
+            attributes["dim"] = normed[0] if normed else -1
+            attributes["keepdim"] = 1 if keepdim else 0
         elif opcode in (OpCode.SUM, OpCode.AMAX, OpCode.AMIN):
-            input_tensor_ids.append(node_to_tensor[node.args[0]].id)
+            in_t = node_to_tensor[node.args[0]]
             dim = node.kwargs.get("dim", node.args[1] if len(node.args) > 1 else -1)
-            if isinstance(dim, (list, tuple)):
-                dim = dim[0] if len(dim) > 0 else -1
-            attributes["dim"] = int(dim) if dim is not None else -1
             keepdim = node.kwargs.get("keepdim", node.args[2] if len(node.args) > 2 else False)
+            normed = _norm_axes(dim, len(in_t.shape.dims))
+            if len(normed) > 1:
+                cur_t = chain_single_axis_reduction(
+                    g, in_t, opcode, normed, bool(keepdim), node.name
+                )
+                node_to_tensor[node] = cur_t
+                name_to_tensor[node.name] = cur_t
+                continue
+            input_tensor_ids.append(in_t.id)
+            attributes["dim"] = normed[0] if normed else -1
             attributes["keepdim"] = 1 if keepdim else 0
         elif opcode == OpCode.CONCAT:
             # aten.cat.default(tensors, dim=0)
@@ -797,15 +903,19 @@ def import_exported_program(ep: ExportedProgram, graph_name: str = "main") -> Gr
                 input_tensor_ids.append(node_to_tensor[sub_node].id)
             attributes["dim"] = int(node.args[1]) if len(node.args) > 1 else 0
         elif opcode == OpCode.EXPAND:
-            # aten.expand.default(self, size)
             input_tensor_ids.append(node_to_tensor[node.args[0]].id)
-            dims = []
-            for d in node.args[1]:
-                if isinstance(d, Node):
-                    dims.append(_symint_to_dim(d.meta.get("val")))
-                else:
-                    dims.append(_symint_to_dim(d))
-            attributes["shape"] = tuple(dims)
+            if "expand_as" in target_str:
+                # aten.expand_as.default(self, other)
+                attributes["shape"] = tuple(node_to_tensor[node.args[1]].shape.dims)
+            else:
+                # aten.expand.default(self, size)
+                dims = []
+                for d in node.args[1]:
+                    if isinstance(d, Node):
+                        dims.append(_symint_to_dim(d.meta.get("val")))
+                    else:
+                        dims.append(_symint_to_dim(d))
+                attributes["shape"] = tuple(dims)
         elif opcode in (OpCode.SQUEEZE, OpCode.UNSQUEEZE):
             input_tensor_ids.append(node_to_tensor[node.args[0]].id)
             if len(node.args) > 1 and node.args[1] is not None:
@@ -1060,7 +1170,10 @@ def import_exported_program(ep: ExportedProgram, graph_name: str = "main") -> Gr
                     else attributes["dilation_h"]
                 )
             attributes["groups"] = groups
-            # Check if this is a grouped convolution that needs decomposition (1 < groups < in_channels)
+            # Check if this is a grouped convolution that needs decomposition:
+            # 1 < groups < in_channels, or groups == in_channels with a channel
+            # multiplier (out_channels != in_channels, so not depthwise).
+            # True depthwise (groups == in == out) stays a single DW conv.
             in_t_candidate = node_to_tensor[node.args[0]]
             w_t_candidate = node_to_tensor[node.args[1]]
             bias_t_candidate = (
@@ -1081,7 +1194,14 @@ def import_exported_program(ep: ExportedProgram, graph_name: str = "main") -> Gr
                 cin_val = int(in_t_candidate.shape.dims[1].evaluate({}))
                 cout_val = int(w_t_candidate.shape.dims[0].evaluate({}))
                 g_val = int(groups)
-                if 1 < g_val < cin_val:
+                is_true_dw = g_val == cin_val == cout_val
+                if (
+                    g_val > 1
+                    and not is_true_dw
+                    and g_val <= cin_val
+                    and cin_val % g_val == 0
+                    and cout_val % g_val == 0
+                ):
                     cin_per_group = cin_val // g_val
                     cout_per_group = cout_val // g_val
                     out_group_tensors = []

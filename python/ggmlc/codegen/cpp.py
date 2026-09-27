@@ -58,6 +58,7 @@ class GGMLCCppCodeGenerator:
             "#include <unordered_map>",
             "#include <memory>",
             "#include <cmath>",
+            "#include <cfloat>",
             "#include <algorithm>",
             "#include <utility>",
             "#include <fstream>",
@@ -78,7 +79,7 @@ class GGMLCCppCodeGenerator:
             f"namespace {self.model_name} {{",
             "",
             "// ----------------------------------------------------------------------------",
-            "// Broadcast helper for elementwise ops (mirrors the interpreter).",
+            "// Broadcast helper for elementwise ops.",
             "// ggml binary ops need `b` repeatable to `a`; this aligns the pair first.",
             "// ----------------------------------------------------------------------------",
             "inline std::pair<struct ggml_tensor*, struct ggml_tensor*> match_broadcast(",
@@ -117,7 +118,63 @@ class GGMLCCppCodeGenerator:
             "        if (!ggml_is_contiguous(b)) b = ggml_cont(ctx, b);",
             "        b = ggml_repeat_4d(ctx, b, target_ne[0], target_ne[1], target_ne[2], target_ne[3]);",
             "    }",
+            "    if (a->type != b->type) {",
+            "        if (a->type == GGML_TYPE_I32 && b->type == GGML_TYPE_F32) {",
+            "            if (!ggml_is_contiguous(a)) a = ggml_cont(ctx, a);",
+            "            a = ggml_cast(ctx, a, GGML_TYPE_F32);",
+            "        } else if (b->type == GGML_TYPE_I32 && a->type == GGML_TYPE_F32) {",
+            "            if (!ggml_is_contiguous(b)) b = ggml_cont(ctx, b);",
+            "            b = ggml_cast(ctx, b, GGML_TYPE_F32);",
+            "        }",
+            "    }",
             "    return {a, b};",
+            "}",
+            "",
+            "// ----------------------------------------------------------------------------",
+            "// Pairwise concat helper.",
+            "// Skips empty inputs and aligns contiguity before concatenating.",
+            "// ----------------------------------------------------------------------------",
+            "inline struct ggml_tensor* concat_pair(",
+            "    struct ggml_context* ctx,",
+            "    struct ggml_tensor* a,",
+            "    struct ggml_tensor* b,",
+            "    int ggml_dim) {",
+            "    auto is_empty = [](struct ggml_tensor* t) {",
+            "        return t->ne[0] == 0 || t->ne[1] == 0 || t->ne[2] == 0 || t->ne[3] == 0;",
+            "    };",
+            "    if (is_empty(a)) return b;",
+            "    if (is_empty(b)) return a;",
+            "    if (!ggml_is_contiguous(a)) a = ggml_cont(ctx, a);",
+            "    if (!ggml_is_contiguous(b)) b = ggml_cont(ctx, b);",
+            "    return ggml_concat(ctx, a, b, ggml_dim);",
+            "}",
+            "",
+            "// ----------------------------------------------------------------------------",
+            "// Depthwise-conv layout helper.",
+            "// _direct wants weight [KW,KH,1,C] x input [W,H,C,N]; fold 1D",
+            "// layouts and cast to F32 (CUDA dw is F32-only). Mirrors the",
+            "// interpreter.",
+            "// ----------------------------------------------------------------------------",
+            "inline std::pair<struct ggml_tensor*, struct ggml_tensor*> match_dw_layout(",
+            "    struct ggml_context* ctx,",
+            "    struct ggml_tensor* w,",
+            "    struct ggml_tensor* x,",
+            "    int is_1d) {",
+            "    if (is_1d && w->ne[3] == 1) {",
+            "        if (!ggml_is_contiguous(w)) w = ggml_cont(ctx, w);",
+            "        w = ggml_cont(ctx, ggml_reshape_4d(ctx, w, w->ne[0], 1, w->ne[1], w->ne[2]));",
+            "    }",
+            "    if (is_1d && x->ne[3] == 1) {",
+            "        if (!ggml_is_contiguous(x)) x = ggml_cont(ctx, x);",
+            "        x = ggml_cont(ctx, ggml_reshape_4d(ctx, x, x->ne[0], 1, x->ne[1], x->ne[2]));",
+            "    }",
+            "    if (w->ne[2] != 1 && w->ne[3] == 1) {",
+            "        if (!ggml_is_contiguous(w)) w = ggml_cont(ctx, w);",
+            "        w = ggml_cont(ctx, ggml_reshape_4d(ctx, w, w->ne[0], w->ne[1], 1, w->ne[2]));",
+            "    }",
+            "    if (w->type != GGML_TYPE_F32) w = ggml_cast(ctx, w, GGML_TYPE_F32);",
+            "    if (x->type != GGML_TYPE_F32) x = ggml_cast(ctx, x, GGML_TYPE_F32);",
+            "    return {w, x};",
             "}",
             "",
             "// ----------------------------------------------------------------------------",
@@ -207,7 +264,10 @@ class GGMLCCppCodeGenerator:
                 "    const std::unordered_map<std::string, struct ggml_tensor*>& inputs,",
                 "    const std::unordered_map<std::string, int64_t>& symbols = {}",
                 ") {",
-                "    struct ggml_cgraph* gf = ggml_new_graph(ctx);",
+                # Each graph op expands to several ggml kernels, so size the
+                # arena generously from the node count instead of ggml's default.
+                f"    size_t graph_nodes = std::max<size_t>(32768, {len(self.graph.nodes) * 16});",
+                "    struct ggml_cgraph* gf = ggml_new_graph_custom(ctx, graph_nodes, false);",
                 "",
                 "    // Mapping from tensor ID to allocated computation node",
                 "    std::unordered_map<uint32_t, struct ggml_tensor*> tensors;",
@@ -331,7 +391,11 @@ class GGMLCCppCodeGenerator:
         elif node.opcode == GGMLOpCode.GGML_OP_UNARY:
             u_type = node.attributes.get("unary_op", "gelu")
             u_str = str(u_type).lower()
-            if "gelu" in u_str or u_type == 8:
+            if "erf" in u_str or u_type == 16:
+                lines.append(
+                    f"    tensors[{out_id}] = ggml_unary(ctx, {inp_vars[0]}, GGML_UNARY_OP_GELU_ERF);"
+                )
+            elif "gelu" in u_str or u_type == 8:
                 lines.append(
                     f"    tensors[{out_id}] = ggml_unary(ctx, {inp_vars[0]}, GGML_UNARY_OP_GELU);"
                 )
@@ -376,10 +440,16 @@ class GGMLCCppCodeGenerator:
                     f"    tensors[{out_id}] = ggml_unary(ctx, {inp_vars[0]}, GGML_UNARY_OP_RELU);"
                 )
         elif node.opcode == GGMLOpCode.GGML_OP_CLAMP:
-            min_v = node.attributes.get("min", 0.0)
-            max_v = node.attributes.get("max", 6.0)
+            if "min" in node.attributes:
+                min_expr = f"{node.attributes['min']}f"
+            else:
+                min_expr = "-FLT_MAX"
+            if "max" in node.attributes:
+                max_expr = f"{node.attributes['max']}f"
+            else:
+                max_expr = "FLT_MAX"
             lines.append(
-                f"    tensors[{out_id}] = ggml_clamp(ctx, {inp_vars[0]}, {min_v}f, {max_v}f);"
+                f"    tensors[{out_id}] = ggml_clamp(ctx, {inp_vars[0]}, {min_expr}, {max_expr});"
             )
         elif node.opcode == GGMLOpCode.GGML_OP_CONV_2D:
             s0 = node.attributes.get("stride_w", 1)
@@ -393,8 +463,13 @@ class GGMLCCppCodeGenerator:
             )
             if len(inp_vars) > 2:
                 lines.append(
-                    f"    tensors[{out_id}] = ggml_add(ctx, tensors[{out_id}], {inp_vars[2]});"
+                    f"    auto bcb_{node.id} = match_broadcast(ctx, tensors[{out_id}], {inp_vars[2]});"
                 )
+                lines.append(
+                    f"    tensors[{out_id}] = ggml_add(ctx, bcb_{node.id}.first, bcb_{node.id}.second);"
+                )
+            if node.attributes.get("fused_relu", 0):
+                lines.append(f"    tensors[{out_id}] = ggml_relu(ctx, tensors[{out_id}]);")
         elif node.opcode == GGMLOpCode.GGML_OP_CONV_2D_DW:
             s0 = node.attributes.get("stride_w", 1)
             s1 = node.attributes.get("stride_h", 1)
@@ -402,13 +477,22 @@ class GGMLCCppCodeGenerator:
             p1 = node.attributes.get("pad_h", 0)
             d0 = node.attributes.get("dilation_w", 1)
             d1 = node.attributes.get("dilation_h", 1)
+            is_1d = int(node.attributes.get("is_1d", 0))
             lines.append(
-                f"    tensors[{out_id}] = ggml_conv_2d_dw(ctx, {inp_vars[0]}, {inp_vars[1]}, {s0}, {s1}, {p0}, {p1}, {d0}, {d1});"
+                f"    auto dw_{node.id} = match_dw_layout(ctx, {inp_vars[0]}, {inp_vars[1]}, {is_1d});"
+            )
+            lines.append(
+                f"    tensors[{out_id}] = ggml_conv_2d_dw_direct(ctx, dw_{node.id}.first, dw_{node.id}.second, {s0}, {s1}, {p0}, {p1}, {d0}, {d1});"
             )
             if len(inp_vars) > 2:
                 lines.append(
-                    f"    tensors[{out_id}] = ggml_add(ctx, tensors[{out_id}], {inp_vars[2]});"
+                    f"    auto bcb_{node.id} = match_broadcast(ctx, tensors[{out_id}], {inp_vars[2]});"
                 )
+                lines.append(
+                    f"    tensors[{out_id}] = ggml_add(ctx, bcb_{node.id}.first, bcb_{node.id}.second);"
+                )
+            if node.attributes.get("fused_relu", 0):
+                lines.append(f"    tensors[{out_id}] = ggml_relu(ctx, tensors[{out_id}]);")
         elif node.opcode == GGMLOpCode.GGML_OP_POOL_2D:
             is_max = node.attributes.get("is_max", 0) != 0
             pool_enum = "GGML_OP_POOL_MAX" if is_max else "GGML_OP_POOL_AVG"
@@ -488,7 +572,12 @@ class GGMLCCppCodeGenerator:
             k_var = inp_vars[1]
             v_var = inp_vars[2] if len(inp_vars) > 2 else "nullptr"
             mask_var = inp_vars[3] if len(inp_vars) > 3 else "nullptr"
-            scale = node.attributes.get("scale", 1.0)
+            # Absent scale means the PyTorch default 1/sqrt(head_dim),
+            # computed from q at runtime since the dim may be symbolic.
+            if "scale" in node.attributes:
+                scale_expr = f"{node.attributes['scale']}f"
+            else:
+                scale_expr = f"(1.0f / sqrtf((float)q_{node.id}->ne[0]))"
             lines.append(
                 f"    struct ggml_tensor* q_{node.id} = {q_var}; if (!ggml_is_contiguous(q_{node.id})) q_{node.id} = ggml_cont(ctx, q_{node.id});"
             )
@@ -499,8 +588,14 @@ class GGMLCCppCodeGenerator:
                 f"    struct ggml_tensor* v_{node.id} = {v_var}; if (v_{node.id} && !ggml_is_contiguous(v_{node.id})) v_{node.id} = ggml_cont(ctx, v_{node.id});"
             )
             lines.append(
-                f"    tensors[{out_id}] = ggml_flash_attn_ext(ctx, q_{node.id}, k_{node.id}, v_{node.id}, {mask_var}, {scale}f, 0.0f, 0.0f);"
+                f"    tensors[{out_id}] = ggml_flash_attn_ext(ctx, q_{node.id}, k_{node.id}, v_{node.id}, {mask_var}, {scale_expr}, 0.0f, 0.0f);"
             )
+            # Raw output is heads-major; the graph layout needs L/H swapped
+            # unless the transpose is already fused upstream.
+            if not node.attributes.get("fused_transpose", 0):
+                lines.append(
+                    f"    tensors[{out_id}] = ggml_permute(ctx, tensors[{out_id}], 0, 2, 1, 3);"
+                )
         elif node.opcode == GGMLOpCode.GGML_OP_ROPE:
             n_dims = node.attributes.get("n_dims", 0)
             mode = node.attributes.get("mode", 0)
@@ -528,9 +623,27 @@ class GGMLCCppCodeGenerator:
             )
         elif node.opcode == GGMLOpCode.GGML_OP_CONCAT:
             dim = node.attributes.get("ggml_dim", node.attributes.get("dim", 0))
+            if len(inp_vars) > 2:
+                parts = ", ".join(inp_vars)
+                lines.append(f"    struct ggml_tensor* cc_parts_{node.id}[] = {{{parts}}};")
+                lines.append(f"    struct ggml_tensor* cc_{node.id} = cc_parts_{node.id}[0];")
+                lines.append(
+                    f"    for (int ci_{node.id} = 1; ci_{node.id} < {len(inp_vars)}; ++ci_{node.id}) {{"
+                )
+                lines.append(
+                    f"        cc_{node.id} = concat_pair(ctx, cc_{node.id}, cc_parts_{node.id}[ci_{node.id}], {dim});"
+                )
+                lines.append("    }")
+            else:
+                lines.append(f"    struct ggml_tensor* cc_{node.id} = {inp_vars[0]};")
+                if len(inp_vars) > 1:
+                    lines.append(
+                        f"    cc_{node.id} = concat_pair(ctx, cc_{node.id}, {inp_vars[1]}, {dim});"
+                    )
             lines.append(
-                f"    tensors[{out_id}] = ggml_concat(ctx, {inp_vars[0]}, {inp_vars[1]}, {dim});"
+                f"    if (cc_{node.id} && !ggml_is_contiguous(cc_{node.id})) cc_{node.id} = ggml_cont(ctx, cc_{node.id});"
             )
+            lines.append(f"    tensors[{out_id}] = cc_{node.id};")
         elif node.opcode == GGMLOpCode.GGML_OP_CONT:
             lines.append(f"    tensors[{out_id}] = ggml_cont(ctx, {inp_vars[0]});")
         elif node.opcode == GGMLOpCode.GGML_OP_SCALE:
@@ -561,20 +674,19 @@ class GGMLCCppCodeGenerator:
                     f"    sr_{node.id} = ggml_cont(ctx, ggml_transpose(ctx, sr_{node.id}));"
                 )
             elif g_dim >= 2:
+                # Single-axis reduction: swap axis g_dim to position 0,
+                # reduce, swap back (ggml only reduces rows).
+                swap = "2, 1, 0, 3" if g_dim == 2 else "3, 1, 2, 0"
                 lines.append(f"    struct ggml_tensor* sr_{node.id} = {inp_vars[0]};")
                 lines.append(
                     f"    if (!ggml_is_contiguous(sr_{node.id})) sr_{node.id} = ggml_cont(ctx, sr_{node.id});"
                 )
                 lines.append(
-                    f"    sr_{node.id} = ggml_reshape_4d(ctx, sr_{node.id}, sr_{node.id}->ne[0], sr_{node.id}->ne[1] * sr_{node.id}->ne[2], 1, sr_{node.id}->ne[3]);"
-                )
-                lines.append(f"    sr_{node.id} = ggml_cont(ctx, sr_{node.id});")
-                lines.append(
-                    f"    sr_{node.id} = ggml_cont(ctx, ggml_transpose(ctx, sr_{node.id}));"
+                    f"    sr_{node.id} = ggml_cont(ctx, ggml_permute(ctx, sr_{node.id}, {swap}));"
                 )
                 lines.append(f"    sr_{node.id} = ggml_sum_rows(ctx, sr_{node.id});")
                 lines.append(
-                    f"    sr_{node.id} = ggml_cont(ctx, ggml_transpose(ctx, sr_{node.id}));"
+                    f"    sr_{node.id} = ggml_cont(ctx, ggml_permute(ctx, sr_{node.id}, {swap}));"
                 )
             else:
                 lines.append(f"    struct ggml_tensor* sr_{node.id} = {inp_vars[0]};")
@@ -587,6 +699,45 @@ class GGMLCCppCodeGenerator:
             )
             lines.append(
                 f"    tensors[{out_id}] = ggml_reshape_4d(ctx, sr_{node.id}, {', '.join(ne_strs)});"
+            )
+        elif node.opcode == GGMLOpCode.GGML_OP_MEAN:
+            g_dim = node.attributes.get("ggml_dim", 0)
+            out_t = self.graph.tensors[out_id]
+            ne_strs = [_dim_to_cpp_expr(d) for d in out_t.ne]
+            if g_dim == 1:
+                lines.append(
+                    f"    struct ggml_tensor* mn_{node.id} = ggml_cont(ctx, ggml_transpose(ctx, {inp_vars[0]}));"
+                )
+                lines.append(f"    mn_{node.id} = ggml_mean(ctx, mn_{node.id});")
+                lines.append(
+                    f"    mn_{node.id} = ggml_cont(ctx, ggml_transpose(ctx, mn_{node.id}));"
+                )
+            elif g_dim >= 2:
+                # Single-axis reduction: swap axis g_dim to position 0,
+                # reduce, swap back (ggml only reduces rows).
+                swap = "2, 1, 0, 3" if g_dim == 2 else "3, 1, 2, 0"
+                lines.append(f"    struct ggml_tensor* mn_{node.id} = {inp_vars[0]};")
+                lines.append(
+                    f"    if (!ggml_is_contiguous(mn_{node.id})) mn_{node.id} = ggml_cont(ctx, mn_{node.id});"
+                )
+                lines.append(
+                    f"    mn_{node.id} = ggml_cont(ctx, ggml_permute(ctx, mn_{node.id}, {swap}));"
+                )
+                lines.append(f"    mn_{node.id} = ggml_mean(ctx, mn_{node.id});")
+                lines.append(
+                    f"    mn_{node.id} = ggml_cont(ctx, ggml_permute(ctx, mn_{node.id}, {swap}));"
+                )
+            else:
+                lines.append(f"    struct ggml_tensor* mn_{node.id} = {inp_vars[0]};")
+                lines.append(
+                    f"    if (!ggml_is_contiguous(mn_{node.id})) mn_{node.id} = ggml_cont(ctx, mn_{node.id});"
+                )
+                lines.append(f"    mn_{node.id} = ggml_mean(ctx, mn_{node.id});")
+            lines.append(
+                f"    if (!ggml_is_contiguous(mn_{node.id})) mn_{node.id} = ggml_cont(ctx, mn_{node.id});"
+            )
+            lines.append(
+                f"    tensors[{out_id}] = ggml_reshape_4d(ctx, mn_{node.id}, {', '.join(ne_strs)});"
             )
         elif node.opcode == GGMLOpCode.GGML_OP_CPY:
             out_t = self.graph.tensors[out_id]
@@ -607,7 +758,11 @@ class GGMLCCppCodeGenerator:
             ne_strs = [_dim_to_cpp_expr(d) for d in out_t.ne]
             start = node.attributes.get("start", 0)
             ggml_dim = node.attributes.get("ggml_dim", 0)
-            offset = f"{start} * {inp_vars[0]}->nb[{ggml_dim}]"
+            mult = node.attributes.get("offset_mult", 1)
+            if mult == 1:
+                offset = f"{start} * {inp_vars[0]}->nb[{ggml_dim}]"
+            else:
+                offset = f"{start} * {mult} * {inp_vars[0]}->nb[{ggml_dim}]"
             lines.append(
                 f"    tensors[{out_id}] = ggml_view_4d(ctx, {inp_vars[0]}, {', '.join(ne_strs)}, {inp_vars[0]}->nb[1], {inp_vars[0]}->nb[2], {inp_vars[0]}->nb[3], {offset});"
             )
@@ -668,8 +823,11 @@ class GGMLCCppCodeGenerator:
             )
             lines.append("    #endif")
         else:
-            lines.append(f"    // Generic fallback for opcode {node.opcode.name}")
-            lines.append(f"    tensors[{out_id}] = {inp_vars[0]};")
+            raise NotImplementedError(
+                f"no C++ emission for {node.opcode.name} "
+                f"(node {node.id}, '{node.name}'); "
+                f"lower it to supported ops or add an emitter"
+            )
 
         return lines
 
