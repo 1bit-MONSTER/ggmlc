@@ -9,6 +9,13 @@ set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 option(GGMLC_ENABLE_CUDA "Enable CUDA backend in ggmlc" OFF)
 option(GGMLC_ENABLE_METAL "Enable Metal backend in ggmlc" OFF)
 option(GGMLC_ENABLE_VULKAN "Enable Vulkan backend in ggmlc" OFF)
+option(GGMLC_ENABLE_HRX "Enable the HRX backend (needs GGMLC_GGML_DIR: a ggml tree with ggml-hrx)" OFF)
+set(GGMLC_GGML_DIR "" CACHE PATH "Build this ggml tree instead of third_party/ggml")
+if (GGMLC_GGML_DIR)
+    set(GGMLC_GGML_ROOT ${GGMLC_GGML_DIR})
+else()
+    set(GGMLC_GGML_ROOT ${CMAKE_CURRENT_SOURCE_DIR}/third_party/ggml)
+endif()
 option(GGMLC_BUILD_EXAMPLES "Build downstream application examples" ON)
 option(GGMLC_BUILD_TESTS "Build native runtime tests" OFF)
 
@@ -18,9 +25,9 @@ endif()
 
 # Includes
 include_directories(
-    ${CMAKE_CURRENT_SOURCE_DIR}/third_party/ggml/include
-    ${CMAKE_CURRENT_SOURCE_DIR}/third_party/ggml/src
-    ${CMAKE_CURRENT_SOURCE_DIR}/third_party/ggml/src/ggml-cpu
+    ${GGMLC_GGML_ROOT}/include
+    ${GGMLC_GGML_ROOT}/src
+    ${GGMLC_GGML_ROOT}/src/ggml-cpu
     ${CMAKE_CURRENT_SOURCE_DIR}/runtime/include
 )
 
@@ -55,6 +62,13 @@ elseif (GGMLC_ENABLE_METAL)
 
     add_subdirectory(third_party/ggml)
     add_compile_definitions(GGML_USE_METAL)
+elseif (GGMLC_ENABLE_HRX)
+    set(GGML_HRX ON CACHE BOOL "Enable HRX in GGML" FORCE)
+    set(GGML_BUILD_TESTS OFF CACHE BOOL "Disable GGML tests" FORCE)
+    set(GGML_BUILD_EXAMPLES OFF CACHE BOOL "Disable GGML examples" FORCE)
+    set(BUILD_SHARED_LIBS OFF CACHE BOOL "Build static GGML libraries" FORCE)
+    add_subdirectory(${GGMLC_GGML_DIR} ggml)
+    add_compile_definitions(GGML_USE_HRX)
 elseif (GGMLC_ENABLE_VULKAN)
     set(GGML_VULKAN ON CACHE BOOL "Enable Vulkan in GGML" FORCE)
     set(GGML_BUILD_TESTS OFF CACHE BOOL "Disable GGML tests" FORCE)

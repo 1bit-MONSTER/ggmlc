@@ -17,6 +17,10 @@
 #include "ggml.h"
 #include "ggml-impl.h"
 #include "ggml-backend.h"
+#include <set>
+#include <map>
+#include <cstdio>
+#include <cstdlib>
 #include "ggml-alloc.h"
 #include "ggml-cpu.h"
 #if defined(GGML_USE_CUDA)
@@ -195,6 +199,9 @@ std::vector<std::string> ModelExecutor::get_available_devices() {
 #if defined(GGML_USE_METAL)
     devices.push_back("metal");
 #endif
+#if defined(GGML_USE_HRX)
+    if (ggml_backend_dev_by_name("HRX0")) devices.push_back("hrx");
+#endif
 #if defined(GGML_USE_VULKAN)
     int n_vk = ggml_backend_vk_get_device_count();
     for (int i = 0; i < n_vk; ++i) {
@@ -261,6 +268,18 @@ ModelExecutor::ModelExecutor(const SerializedModelGraph& graph, const std::strin
             throw std::runtime_error("Failed to initialize GGML Metal backend.");
         }
         device_ = "metal";
+        is_cuda_ = false;
+    }
+#endif
+#if defined(GGML_USE_HRX)
+    else if (dev_lower.rfind("hrx", 0) == 0) {
+        // AMD's HRX (IREE HAL) backend, through the generic device registry
+        ggml_backend_dev_t dev = ggml_backend_dev_by_name("HRX0");
+        backend_ = dev ? ggml_backend_dev_init(dev, nullptr) : nullptr;
+        if (!backend_) {
+            throw std::runtime_error("Failed to initialize the GGML HRX backend (HRX0)");
+        }
+        device_ = "hrx";
         is_cuda_ = false;
     }
 #endif
@@ -3046,6 +3065,33 @@ void ModelExecutor::run(int n_threads) {
     // Outer CUDAGraphManager capture nests with ggml_backend_cuda_graph_compute and
     // aborts on bucket switches; pad-stable SET_ROWS graphs make that wrapper unnecessary.
 
+    if (const char* rep = std::getenv("GGMLC_REPORT_OPS"); rep && *rep) {
+        // every distinct (op, types, contiguity) in the graph, with a count, once per shape bucket
+        static std::set<std::string> printed;
+        std::map<std::string, int> counts;
+        for (int i = 0; i < ggml_graph_n_nodes(cgraph_); ++i) {
+            ggml_tensor* t = ggml_graph_node(cgraph_, i);
+            std::string key = std::string(ggml_op_desc(t)) + " " + ggml_type_name(t->type);
+            for (int j = 0; j < GGML_MAX_SRC && t->src[j]; ++j)
+                key += std::string(j ? "," : " <- ") + ggml_type_name(t->src[j]->type) + (ggml_is_contiguous(t->src[j]) ? "" : "(strided)") +
+                       (j && ggml_nelements(t->src[j]) != ggml_nelements(t->src[0]) ? "(bcast)" : "");
+            counts[key]++;
+        }
+        for (auto& [k, n] : counts)
+            if (printed.insert(k).second) std::fprintf(stderr, "[op] %4d  %s\n", n, k.c_str());
+    }
+    if (const char* rep = std::getenv("GGMLC_REPORT_UNSUPPORTED"); rep && *rep) {
+        // every node the backend cannot run, once per (op, types), for porting to a new backend
+        static std::set<std::string> seen;
+        for (int i = 0; i < ggml_graph_n_nodes(cgraph_); ++i) {
+            ggml_tensor* t = ggml_graph_node(cgraph_, i);
+            if (ggml_backend_supports_op(backend_, t)) continue;
+            std::string key = std::string(ggml_op_desc(t)) + " " + ggml_type_name(t->type);
+            for (int j = 0; j < GGML_MAX_SRC && t->src[j]; ++j) key += std::string(j ? "," : " <- ") + ggml_type_name(t->src[j]->type);
+            if (seen.insert(key).second) std::fprintf(stderr, "[unsupported] %s  e.g. %s [%lld,%lld,%lld,%lld]\n", key.c_str(), t->name,
+                (long long)t->ne[0], (long long)t->ne[1], (long long)t->ne[2], (long long)t->ne[3]);
+        }
+    }
     enum ggml_status status = ggml_backend_graph_compute(backend_, cgraph_);
     if (status != GGML_STATUS_SUCCESS) {
         throw std::runtime_error("GGML backend graph compute failed with status: " + std::to_string(status));

@@ -21,8 +21,8 @@ add_executable(laya ${LAYA_SOURCES})
 target_include_directories(laya PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/include
     ${CMAKE_CURRENT_SOURCE_DIR}/../../runtime/include
-    ${CMAKE_CURRENT_SOURCE_DIR}/../../third_party/ggml/include
-    ${CMAKE_CURRENT_SOURCE_DIR}/../../third_party/ggml/src
+    ${GGMLC_GGML_ROOT}/include
+    ${GGMLC_GGML_ROOT}/src
 )
 
 target_link_libraries(laya PRIVATE ggmlc_runtime)
