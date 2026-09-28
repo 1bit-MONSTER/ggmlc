@@ -277,6 +277,11 @@ def _lower_op(
         in_t = c_graph.get_tensor(in_ids[0])
         R = len(in_t.shape.dims)
         dim = attrs.get("dim", -1)
+        if isinstance(dim, (tuple, list)):
+            raise NotImplementedError(
+                f"Multi-axis MEAN '{op.name}' must be chained into single-axis "
+                f"ops by the frontend, got dim={dim}"
+            )
         if dim < 0:
             dim += R
         ggml_dim = R - 1 - dim
@@ -287,6 +292,11 @@ def _lower_op(
         R = len(in_t.shape.dims)
         axes = attrs.get("axes", None) or attrs.get("dim", -1)
         if isinstance(axes, (tuple, list)):
+            if len(axes) > 1:
+                raise NotImplementedError(
+                    f"Multi-axis {opcode.value} '{op.name}' must be chained into "
+                    f"single-axis ops by the frontend, got axes={axes}"
+                )
             dim = axes[0] if len(axes) > 0 else -1
         else:
             dim = int(axes)
@@ -313,12 +323,18 @@ def _lower_op(
             op.name,
         )
     elif opcode == OpCode.GELU:
+        approx = str(attrs.get("approximate", "none")).lower()
+        gelu_op = (
+            GGMLUnaryOpCode.GGML_UNARY_OP_GELU_ERF
+            if approx in ("none", "erf")
+            else GGMLUnaryOpCode.GGML_UNARY_OP_GELU
+        )
         return GGMLOpDef(
             op.id,
             GGMLOpCode.GGML_OP_UNARY,
             in_ids,
             out_ids,
-            {"unary_op": int(GGMLUnaryOpCode.GGML_UNARY_OP_GELU)},
+            {"unary_op": int(gelu_op)},
             op.name,
         )
     elif opcode == OpCode.SILU:
@@ -514,7 +530,21 @@ def _lower_op(
         ):
             w_ic = w_t.shape.dims[1].evaluate({})
             x_ic = x_t.shape.dims[1].evaluate({})
-            if w_ic == 1 and (groups > 1 or x_ic > 1):
+            w_oc = w_t.shape.dims[0].evaluate({}) if w_t.shape.dims[0].is_static() else None
+            if w_ic == 1 and groups > 1:
+                # True depthwise needs one filter per input channel.
+                # Grouped-with-multiplier (e.g. groups=80, C_in=80,
+                # C_out=160) has no ggml op and must be decomposed
+                # per group by the importer.
+                if (w_oc is None or w_oc == groups) and x_ic == groups:
+                    is_dw = True
+                else:
+                    raise ValueError(
+                        f"grouped convolution '{op.name}' (id={op.id}) is not "
+                        f"depthwise (groups={groups}, in_channels={x_ic}, "
+                        f"out_channels={w_oc}); ggml has no grouped-conv op"
+                    )
+            elif w_ic == 1 and x_ic > 1:
                 is_dw = True
         elif len(w_t.shape.dims) == 3 and w_t.shape.dims[1].is_static():
             # Conv1d depthwise: weight [C, 1, K]
@@ -568,6 +598,20 @@ def _lower_op(
         if dim < 0:
             dim += R
         ggml_dim = R - 1 - dim if R > 0 else 0
+        if ggml_dim > 3:
+            # Outer dims fold into ne[3] (canonical_shape_to_ggml_ne): the
+            # slice lands on ggml dim 3, with an offset multiplier covering
+            # the folded dims inner to the sliced one.
+            ggml_dim = 3
+            mult = 1
+            for d in in_t.shape.dims[dim + 1 : R - 3]:
+                if isinstance(d, StaticDim):
+                    mult *= d.value
+                else:
+                    raise ValueError(  # noqa: TRY004 - unsupported shape, not a type error
+                        f"slice of folded dim {dim} needs static inner shape (tensor '{in_t.name}')"
+                    )
+            attrs["offset_mult"] = int(mult)
         attrs["ggml_dim"] = int(ggml_dim)
         attrs["start"] = int(start)
         return GGMLOpDef(op.id, GGMLOpCode.GGML_OP_VIEW, in_ids, out_ids, attrs, op.name)
@@ -592,7 +636,9 @@ def _lower_op(
                 else:
                     axes[i] = i
         if any(ax >= 4 for ax in axes):
-            return GGMLOpDef(op.id, GGMLOpCode.GGML_OP_RESHAPE, in_ids, out_ids, attrs, op.name)
+            raise NotImplementedError(
+                f"Permute {op.name} results in a non-expressible ggml permute: axes={axes}"
+            )
         attrs["axis0"] = axes[0]
         attrs["axis1"] = axes[1]
         attrs["axis2"] = axes[2]

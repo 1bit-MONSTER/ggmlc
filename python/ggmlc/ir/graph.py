@@ -5,7 +5,7 @@ from pathlib import Path
 
 from ggmlc.ir.dtype import DType
 from ggmlc.ir.op import OpCode, Operation
-from ggmlc.ir.shape import Shape
+from ggmlc.ir.shape import Shape, StaticDim
 from ggmlc.ir.state import StateDeclaration
 from ggmlc.ir.tensor import StorageClass, Tensor
 
@@ -167,3 +167,51 @@ class Graph:
         from ggmlc.visualization.mermaid import visualize
 
         return visualize(self, output_path=output_path, format=format, title=self.name)
+
+
+def chain_single_axis_reduction(
+    g: Graph,
+    in_t: Tensor,
+    opcode: OpCode,
+    normed: list[int],
+    keepdim: bool,
+    base_name: str,
+    final_out: Tensor | None = None,
+) -> Tensor:
+    """Chain a multi-axis reduction into single-axis ops (ggml reduces one axis).
+
+    Intermediates keep rank (unit dims) so later indices stay valid; only the
+    last op honors keepdim (dropping every reduced dim when False).
+    """
+    tag = opcode.value
+    cur_id = in_t.id
+    cur_dims = list(in_t.shape.dims)
+    cur_t = in_t
+    for j, d in enumerate(normed):
+        last = j == len(normed) - 1
+        kd = keepdim if last else True
+        out_dims = list(cur_dims)
+        if kd:
+            out_dims[d] = StaticDim(1)
+        else:
+            doomed = set(normed)
+            out_dims = [dd for i, dd in enumerate(cur_dims) if i not in doomed]
+        if last and final_out is not None:
+            cur_t = final_out
+        else:
+            cur_t = g.add_tensor(
+                name=base_name if last else f"{base_name}_{tag}_d{d}",
+                shape=Shape(out_dims),
+                dtype=in_t.dtype,
+                storage=StorageClass.ACTIVATION,
+            )
+        g.add_op(
+            opcode=opcode,
+            inputs=[cur_id],
+            outputs=[cur_t.id],
+            attributes={"dim": d, "keepdim": 1 if kd else 0},
+            name=f"{base_name}_{tag}_d{d}",
+        )
+        cur_id = cur_t.id
+        cur_dims = out_dims
+    return cur_t

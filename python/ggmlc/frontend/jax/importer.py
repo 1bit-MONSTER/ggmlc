@@ -6,7 +6,7 @@ from typing import Any
 import numpy as np
 
 from ggmlc.ir.dtype import DType
-from ggmlc.ir.graph import Graph
+from ggmlc.ir.graph import Graph, chain_single_axis_reduction
 from ggmlc.ir.op import OpCode
 from ggmlc.ir.shape import Shape, StaticDim
 from ggmlc.ir.tensor import StorageClass, Tensor
@@ -64,6 +64,58 @@ def _jax_dtype_to_dtype(dtype: Any) -> DType:
     if dt in (np.dtype(np.float64), np.dtype(bool), np.dtype(np.uint8), np.dtype(np.int8)):
         return DType.F32
     return DType.from_numpy(dt)
+
+
+def _pad_nhwc_asymmetric(
+    g: Graph,
+    t: Tensor,
+    h_pair: tuple[int, int],
+    w_pair: tuple[int, int],
+) -> Tensor:
+    """Zero-pad NHWC sides ggml conv padding cannot express (top/left/bottom/right).
+
+    Implemented as zero concats (fully supported in both runners); the caller
+    then uses the symmetric minimum as the conv padding.
+    """
+    if t.dtype != DType.F32:
+        raise NotImplementedError(f"asymmetric pad needs F32 input, got {t.dtype}")
+    # NOTE: keep names free of brackets/colons: parameter names are matched
+    # verbatim by the GGUF loader, which chokes on jaxpr-style characters.
+    tag = f"padconv_{len(g.tensors)}"
+    dims = [int(d.value) if isinstance(d, StaticDim) else int(d) for d in t.shape.dims]
+    for axis, (before, after) in ((1, h_pair), (2, w_pair)):
+        for side, k in (("pre", before), ("post", after)):
+            if k <= 0:
+                continue
+            z_dims = list(dims)
+            z_dims[axis] = k
+            z = g.add_tensor(
+                name=f"{tag}_zeros_d{axis}_{side}",
+                shape=Shape.from_tuple(tuple(z_dims)),
+                dtype=t.dtype,
+                storage=StorageClass.CONSTANT,
+                data=np.zeros(tuple(z_dims), dtype=np.float32),
+            )
+            g.parameters.append(z.id)
+            padded_dims = list(dims)
+            padded_dims[axis] = dims[axis] + k
+            out = g.add_tensor(
+                name=f"{tag}_pad_d{axis}_{side}",
+                shape=Shape.from_tuple(tuple(padded_dims)),
+                dtype=t.dtype,
+                storage=StorageClass.ACTIVATION,
+            )
+            ins = [z.id, t.id] if side == "pre" else [t.id, z.id]
+            g.add_op(
+                opcode=OpCode.CONCAT,
+                inputs=ins,
+                outputs=[out.id],
+                attributes={"dim": axis},
+                name=f"{tag}_pad_d{axis}_{side}",
+            )
+            t = out
+            dims = padded_dims
+    return t
 
 
 def _import_equations(
@@ -908,6 +960,21 @@ def _import_equations(
             else:
                 lhs_t = g.get_tensor(in_tids[0])
 
+            # Asymmetric padding (TF 'SAME' with odd totals, explicit pads):
+            # ggml convs only take symmetric padding, so materialize the
+            # excess sides as zero concats and keep the symmetric minimum.
+            pt0, pt1 = int(padding[0][0]), int(padding[0][1])
+            pl0, pl1 = int(padding[1][0]), int(padding[1][1])
+            sym_h, sym_w = min(pt0, pt1), min(pl0, pl1)
+            if (pt0, pt1) != (sym_h, sym_h) or (pl0, pl1) != (sym_w, sym_w):
+                lhs_t = _pad_nhwc_asymmetric(
+                    g,
+                    lhs_t,
+                    (pt0 - sym_h, pt1 - sym_h),
+                    (pl0 - sym_w, pl1 - sym_w),
+                )
+            sym_padding = (sym_h, sym_w)
+
             rhs_t = g.get_tensor(in_tids[1])
 
             def _dim_val(d):
@@ -972,7 +1039,7 @@ def _import_equations(
                 )
                 conv_attrs = {
                     "stride": tuple(window_strides),
-                    "padding": (padding[0][0], padding[1][0]),
+                    "padding": sym_padding,
                     "dilation": tuple(rhs_dilation),
                     "groups": int(feature_group_count),
                 }
@@ -994,7 +1061,7 @@ def _import_equations(
             else:
                 conv_attrs = {
                     "stride": tuple(window_strides),
-                    "padding": (padding[0][0], padding[1][0]),
+                    "padding": sym_padding,
                     "dilation": tuple(rhs_dilation),
                     "groups": int(feature_group_count),
                 }
@@ -1943,6 +2010,30 @@ def _import_equations(
             raise NotImplementedError(
                 f"Unhandled primitive '{prim_name}' reached op emission with None opcode."
             )
+
+        if opcode in (OpCode.SUM, OpCode.AMAX, OpCode.AMIN):
+            # Multi-axis reductions (e.g. global average pool) chain into
+            # single-axis ops; ggml reduces one axis (JAX out drops the axes).
+            raw_axes = eqn.params.get("axes", (-1,))
+            if isinstance(raw_axes, (tuple, list)):
+                axes_list = [int(a) for a in raw_axes]
+            else:
+                axes_list = [int(raw_axes)]
+            in_t = g.get_tensor(in_tids[0])
+            rank = len(in_t.shape.dims)
+            normed = [a + rank if a < 0 else a for a in axes_list]
+            if len(normed) > 1:
+                chained = chain_single_axis_reduction(
+                    g,
+                    in_t,
+                    opcode,
+                    normed,
+                    False,
+                    f"{prim_name}_{out_var}",
+                    final_out=out_t,
+                )
+                var_to_tensor[out_var] = chained
+                continue
 
         g.add_op(
             opcode=opcode,

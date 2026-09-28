@@ -21,6 +21,7 @@ import pytest
 import torch
 from ggmlc.codegen import generate_cpp_project
 from ggmlc.dialect.ggml.lowering import lower_to_ggml
+from ggmlc.dialect.ggml.ops import GGMLOpCode
 from ggmlc.frontend.pytorch import export_torch_model
 from ggmlc.serialization.gguf import save_to_gguf
 from torch import nn
@@ -378,4 +379,236 @@ def test_standalone_l2_normalize(ggml_standalone_libs, tmp_path):
     img_embeds = torch.randn(2, 8, 16)
     _run_standalone(
         L2Normalize().eval(), (img_embeds,), "tiny_l2_normalize", ggml_standalone_libs, tmp_path
+    )
+
+
+def test_standalone_conv2d_bias(ggml_standalone_libs, tmp_path):
+    """CONV_2D with channel-vector bias through generated code matches torch."""
+    torch.manual_seed(0)
+
+    class ConvBias(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.conv = nn.Conv2d(3, 8, 3, padding=1)
+
+        def forward(self, x):
+            return self.conv(x)
+
+    x = torch.randn(1, 3, 16, 16)
+    _run_standalone(ConvBias().eval(), (x,), "tiny_conv2d_bias", ggml_standalone_libs, tmp_path)
+
+
+def test_standalone_concat_multi(ggml_standalone_libs, tmp_path):
+    """Multi-way CONCAT (beyond the first two inputs) matches torch."""
+    torch.manual_seed(0)
+
+    class ConcatFour(nn.Module):
+        def forward(self, a, b, c, d):
+            return torch.cat([a, b, c, d], dim=1)
+
+    args = tuple(torch.randn(1, 2, 8, 8) for _ in range(4))
+    _run_standalone(ConcatFour().eval(), args, "tiny_concat_multi", ggml_standalone_libs, tmp_path)
+
+
+def test_standalone_depthwise_conv2d(ggml_standalone_libs, tmp_path):
+    """True DEPTHWISE conv (direct kernel) through generated code matches torch."""
+    torch.manual_seed(0)
+
+    class Depthwise(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.conv = nn.Conv2d(8, 8, 3, padding=1, groups=8)
+
+        def forward(self, x):
+            return self.conv(x)
+
+    x = torch.randn(1, 8, 16, 16)
+    _run_standalone(
+        Depthwise().eval(), (x,), "tiny_depthwise_conv2d", ggml_standalone_libs, tmp_path
+    )
+
+
+def test_standalone_clamp_min_open(ggml_standalone_libs, tmp_path):
+    """Open-ended clamp_min (no max) must not invent a max bound."""
+    torch.manual_seed(0)
+
+    class ClampMin(nn.Module):
+        def forward(self, x):
+            return (x * 10.0).clamp_min(0.5)
+
+    x = torch.randn(4, 16)
+    _run_standalone(ClampMin().eval(), (x,), "tiny_clamp_min_open", ggml_standalone_libs, tmp_path)
+
+
+def test_standalone_fused_conv_relu(ggml_standalone_libs, tmp_path):
+    """Fused CONV_2D+RELU through generated code matches torch."""
+    torch.manual_seed(0)
+
+    class ConvRelu(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.conv = nn.Conv2d(3, 8, 3, padding=1)
+
+        def forward(self, x):
+            return torch.relu(self.conv(x))
+
+    model = ConvRelu().eval()
+    x = torch.randn(1, 3, 16, 16)
+    exported = export_torch_model(model, (x,), model_name="tiny_fused_conv_relu")
+    ggml_graph = lower_to_ggml(exported.main_graph)
+    fused = [
+        op
+        for op in ggml_graph.nodes
+        if op.opcode == GGMLOpCode.GGML_OP_CONV_2D and op.attributes.get("fused_relu")
+    ]
+    assert fused, "expected conv+relu fusion for coverage"
+    _run_standalone(model, (x,), "tiny_fused_conv_relu", ggml_standalone_libs, tmp_path)
+
+
+def test_standalone_sdpa_default_scale(ggml_standalone_libs, tmp_path):
+    """SDPA without explicit scale uses 1/sqrt(head_dim), matching torch."""
+    torch.manual_seed(0)
+
+    class TinyAttention(nn.Module):
+        def forward(self, q, k, v):
+            return torch.nn.functional.scaled_dot_product_attention(q, k, v)
+
+    q = torch.randn(1, 2, 8, 16)
+    k = torch.randn(1, 2, 8, 16)
+    v = torch.randn(1, 2, 8, 16)
+    _run_standalone(
+        TinyAttention().eval(), (q, k, v), "tiny_sdpa_default_scale", ggml_standalone_libs, tmp_path
+    )
+
+
+def test_standalone_mean_last_dim(ggml_standalone_libs, tmp_path):
+    """MEAN over the last dim through generated code matches torch."""
+    torch.manual_seed(0)
+
+    class MeanLast(nn.Module):
+        def forward(self, x):
+            return x.mean(dim=-1)
+
+    x = torch.randn(4, 16)
+    _run_standalone(MeanLast().eval(), (x,), "tiny_mean_last_dim", ggml_standalone_libs, tmp_path)
+
+
+def test_standalone_mean_middle_dim(ggml_standalone_libs, tmp_path):
+    """MEAN over a middle dim (transpose reduction path) matches torch."""
+    torch.manual_seed(0)
+
+    class MeanMiddle(nn.Module):
+        def forward(self, x):
+            return x.mean(dim=2, keepdim=True)
+
+    x = torch.randn(1, 2, 4, 8)
+    _run_standalone(
+        MeanMiddle().eval(), (x,), "tiny_mean_middle_dim", ggml_standalone_libs, tmp_path
+    )
+
+
+def test_standalone_mean_two_dims(ggml_standalone_libs, tmp_path):
+    """MEAN over two dims (chained decomposition) matches torch."""
+    torch.manual_seed(0)
+
+    class MeanTwoDims(nn.Module):
+        def forward(self, x):
+            return x.mean(dim=(2, 3), keepdim=True)
+
+    x = torch.randn(1, 2, 4, 8)
+    _run_standalone(
+        MeanTwoDims().eval(), (x,), "tiny_mean_two_dims", ggml_standalone_libs, tmp_path
+    )
+
+
+def test_standalone_gelu_exact(ggml_standalone_libs, tmp_path):
+    """Exact (erf) GELU through generated code matches torch."""
+    torch.manual_seed(0)
+
+    class GeluExact(nn.Module):
+        def forward(self, x):
+            return torch.nn.functional.gelu(x * 2.0)
+
+    x = torch.randn(2, 16)
+    _run_standalone(GeluExact().eval(), (x,), "tiny_gelu_exact", ggml_standalone_libs, tmp_path)
+
+
+def test_standalone_mean_channel_dim(ggml_standalone_libs, tmp_path):
+    """MEAN over torch dim 1 (axis-swap reduction path) matches torch."""
+    torch.manual_seed(0)
+
+    class MeanChannel(nn.Module):
+        def forward(self, x):
+            return x.mean(dim=1, keepdim=True)
+
+    x = torch.randn(1, 4, 8, 8)
+    _run_standalone(
+        MeanChannel().eval(), (x,), "tiny_mean_channel_dim", ggml_standalone_libs, tmp_path
+    )
+
+
+def test_standalone_mean_batch_dim(ggml_standalone_libs, tmp_path):
+    """MEAN over torch dim 0 (axis-swap reduction path) matches torch."""
+    torch.manual_seed(0)
+
+    class MeanBatch(nn.Module):
+        def forward(self, x):
+            return x.mean(dim=0, keepdim=True)
+
+    x = torch.randn(2, 4, 8, 8)
+    _run_standalone(MeanBatch().eval(), (x,), "tiny_mean_batch_dim", ggml_standalone_libs, tmp_path)
+
+
+def test_standalone_sum_channel_dim(ggml_standalone_libs, tmp_path):
+    """SUM over torch dim 1 (axis-swap reduction path) matches torch."""
+    torch.manual_seed(0)
+
+    class SumChannel(nn.Module):
+        def forward(self, x):
+            return x.sum(dim=1, keepdim=True)
+
+    x = torch.randn(1, 4, 8, 8)
+    _run_standalone(
+        SumChannel().eval(), (x,), "tiny_sum_channel_dim", ggml_standalone_libs, tmp_path
+    )
+
+
+def test_standalone_qkv_split_permute(ggml_standalone_libs, tmp_path):
+    """QKV reshape/5D-permute/unbind plumbing preserves head/slot order."""
+    torch.manual_seed(0)
+
+    class QKVSplit(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.proj = nn.Linear(32, 3 * 4 * 8, bias=False)
+
+        def forward(self, x):
+            b, _c, h, w = x.shape
+            qkv = self.proj(x.flatten(2).transpose(1, 2))
+            qkv = qkv.reshape(b, h * w, 3, 4, 8).permute(2, 0, 3, 1, 4)
+            q, k, v = qkv[0], qkv[1], qkv[2]
+            return q + 2 * k + 3 * v
+
+    x = torch.randn(1, 32, 4, 4)
+    _run_standalone(
+        QKVSplit().eval(), (x,), "tiny_qkv_split_permute", ggml_standalone_libs, tmp_path
+    )
+
+
+def test_standalone_gelu_tanh(ggml_standalone_libs, tmp_path):
+    """Tanh-approximate GELU through generated code matches torch (loose tol)."""
+    torch.manual_seed(0)
+
+    class GeluTanh(nn.Module):
+        def forward(self, x):
+            return torch.nn.functional.gelu(x * 2.0, approximate="tanh")
+
+    x = torch.randn(2, 16)
+    _run_standalone(
+        GeluTanh().eval(),
+        (x,),
+        "tiny_gelu_tanh",
+        ggml_standalone_libs,
+        tmp_path,
+        atol=5e-3,
     )
