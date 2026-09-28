@@ -1753,6 +1753,10 @@ void ModelExecutor::prepare(const std::unordered_map<std::string, int64_t>& symb
     // 3. Build computation graph
     size_t graph_nodes = std::max<size_t>(32768, model_graph_.ops.size() * 16);
     cgraph_ = ggml_new_graph_custom(ctx_, graph_nodes, false);
+    // an identity for this graph while it is reused (same shape), as ggml_backend_sched gives its
+    // graphs: backends that cache per graph (HRX's command programs and graph replay) key on it,
+    // and treat uid 0 as a new graph on every call
+    cgraph_->uid = ggml_graph_next_uid();
 
     for (const auto& op : model_graph_.ops) {
         if (op.outputs.empty()) continue;
@@ -3065,6 +3069,20 @@ void ModelExecutor::run(int n_threads) {
     // Outer CUDAGraphManager capture nests with ggml_backend_cuda_graph_compute and
     // aborts on bucket switches; pad-stable SET_ROWS graphs make that wrapper unnecessary.
 
+    if (const char* dump = std::getenv("GGMLC_DUMP_GRAPH"); dump && *dump) {
+        // every node once (first graph only): index, op, shape, sources, for finding fusable patterns
+        static bool done = false;
+        if (!done) {
+            done = true;
+            for (int i = 0; i < ggml_graph_n_nodes(cgraph_); ++i) {
+                ggml_tensor* t = ggml_graph_node(cgraph_, i);
+                std::fprintf(stderr, "[node] %d %s %s [%lld,%lld,%lld,%lld] %s <-", i, ggml_op_desc(t), ggml_type_name(t->type),
+                    (long long)t->ne[0], (long long)t->ne[1], (long long)t->ne[2], (long long)t->ne[3], ggml_is_contiguous(t) ? "c" : "s");
+                for (int j = 0; j < GGML_MAX_SRC && t->src[j]; ++j) std::fprintf(stderr, " %s:%s", t->src[j]->name, ggml_op_desc(t->src[j]));
+                std::fprintf(stderr, " = %s\n", t->name);
+            }
+        }
+    }
     if (const char* rep = std::getenv("GGMLC_REPORT_OPS"); rep && *rep) {
         // every distinct (op, types, contiguity) in the graph, with a count, once per shape bucket
         static std::set<std::string> printed;
@@ -3092,7 +3110,12 @@ void ModelExecutor::run(int n_threads) {
                 (long long)t->ne[0], (long long)t->ne[1], (long long)t->ne[2], (long long)t->ne[3]);
         }
     }
+    const auto compute_t0 = std::chrono::steady_clock::now();
     enum ggml_status status = ggml_backend_graph_compute(backend_, cgraph_);
+    if (const char* tm = std::getenv("GGMLC_TIME_COMPUTE"); tm && *tm) {
+        std::fprintf(stderr, "[compute] %.2f ms, %d nodes\n",
+            std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - compute_t0).count(), ggml_graph_n_nodes(cgraph_));
+    }
     if (status != GGML_STATUS_SUCCESS) {
         throw std::runtime_error("GGML backend graph compute failed with status: " + std::to_string(status));
     }
